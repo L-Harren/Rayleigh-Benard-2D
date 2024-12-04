@@ -25,26 +25,29 @@ To run and plot using e.g. 4 processes:
 
 import numpy as np
 import dedalus.public as d3
+import os
 import logging
 logger = logging.getLogger(__name__)
 
 # Output Control Panel
-BUOYANCY    = False
-VORTICITY   = False
-KE          = False
+BUOYANCY    = True
+VORTICITY   = True
+KE          = True
 NUSSELT     = True
+FLUXES      = True
 
 
 # Parameters
-Lx, Lz = 4, 1
-Nx, Nz = 256, 64
-Rayleigh = 1e5
+Lx, Lz = 1, 1
+Nx, Nz = 256, 256
+Rayleigh = 1e7
 Prandtl = 1
 dealias = 3/2
-stop_sim_time = 100
+stop_sim_time = 800
 timestepper = d3.RK222
-max_timestep = 0.125
+max_timestep = 0.01
 dtype = np.float64
+
 
 # Bases
 coords = d3.CartesianCoordinates('x', 'z')
@@ -72,7 +75,10 @@ lift = lambda A: d3.Lift(A, lift_basis, -1)
 grad_u = d3.grad(u) + ez*lift(tau_u1) # First-order reduction
 grad_b = d3.grad(b) + ez*lift(tau_b1) # First-order reduction
 
-w = d3.DotProduct(u , ez)
+ux = d3.DotProduct(u , ex)
+uz = d3.DotProduct(u , ez)
+db_dz = d3.DotProduct(d3.grad(b) , ez)
+dux_dz = d3.DotProduct(d3.grad(ux) , ez)
 
 # Problem
 # First-order form: "div(f)" becomes "trace(grad_f)"
@@ -81,11 +87,21 @@ problem = d3.IVP([p, b, u, tau_p, tau_b1, tau_b2, tau_u1, tau_u2], namespace=loc
 problem.add_equation("trace(grad_u) + tau_p = 0")
 problem.add_equation("dt(b) - kappa*div(grad_b) + lift(tau_b2) = - u@grad(b)")
 problem.add_equation("dt(u) - nu*div(grad_u) + grad(p) - b*ez + lift(tau_u2) = - u@grad(u)")
-problem.add_equation("b(z=0) = Lz")
-problem.add_equation("u(z=0) = 0")
-problem.add_equation("b(z=Lz) = 0")
-problem.add_equation("u(z=Lz) = 0")
 problem.add_equation("integ(p) = 0") # Pressure gauge
+problem.add_equation("b(z=0) = Lz")
+problem.add_equation("b(z=Lz) = 0")
+
+# Stress-free boundary conditions
+problem.add_equation("dux_dz(z=0) = 0")
+problem.add_equation("dux_dz(z=Lz) = 0")
+problem.add_equation("uz(z=0) = 0")
+problem.add_equation("uz(z=Lz) = 0")
+
+
+# No-slip boundary conditions
+# problem.add_equation("u(z=0) = 0")
+# problem.add_equation("u(z=Lz) = 0")
+
 
 # Solver
 solver = problem.build_solver(timestepper)
@@ -93,20 +109,32 @@ solver.stop_sim_time = stop_sim_time
 
 
 # Initial conditions
+#ux['g'] += 0.1 * (2*z - 1)
+
 b.fill_random('g', seed=42, distribution='normal', scale=1e-3) # Random noise
 b['g'] *= z * (Lz - z) # Damp noise at walls
 b['g'] += Lz - z # Add linear background
 
 # Analysis
-snapshots = solver.evaluator.add_file_handler('snapshots', sim_dt=0.25, max_writes=50)
+snapshots = solver.evaluator.add_file_handler('snapshots', sim_dt=0.1, max_writes=10000)
 if BUOYANCY: snapshots.add_task(b, name='buoyancy')
 if VORTICITY: snapshots.add_task(-d3.div(d3.skew(u)), name='vorticity')
 
 # KE & Nusselt from Tom's github > Rayleigh-Benard > rb_convect.py (written in d2 so tried modifying to d3)
 if KE: snapshots.add_task(d3.Integrate( (0.5*(u*u)) , ('x', 'z')), layout="g", name="KE")
-if NUSSELT: snapshots.add_task( (1 + d3.Integrate(b*w , ('x' , 'z'))/kappa) , layout="g", name="Nusselt")
+if NUSSELT: 
+    snapshots.add_task( (1 + d3.Integrate( b*uz , ('x' , 'z')) /kappa) , layout="g", name="Nusselt1")
+    snapshots.add_task( (1 + d3.Integrate( (b*uz)/(-db_dz) , ('x' , 'z')) /kappa) , layout="g", name="Nusselt2")
+    snapshots.add_task( (1 + d3.Integrate( b*uz , ('x' , 'z')) / d3.Integrate( -db_dz , ('x' , 'z')) /kappa) , layout="g", name="Nusselt3")
 
-# Taken from Matt's example
+
+if FLUXES:
+    snapshots.add_task( d3.Average( b*uz , 'x') , layout='g' , name='flux_convective')
+    snapshots.add_task( d3.Average( -db_dz , 'x') , layout='g' , name='flux_conductive')
+    snapshots.add_task( d3.Average( b*uz -db_dz , 'x') , layout='g' , name='flux_total')
+
+
+# Taken from Matt's (d2) example
 # analysis.add_task(" 1.0 + integ( (integ(b*w,'x')/Lx)/(integ((-1.0*P)*bz, 'x')/Lx), 'z')/Lz", layout='g',name='Nu1')
 # analysis.add_task(" 1.0 + integ(integ(b*w/(-1.0*P*bz), 'x'), 'z')/(Lx*Lz)", layout='g', name='Nu2')
 # analysis.add_task(" 1.0 + integ(integ(b*w, 'x'), 'z')/(P*Lx*Lz)", layout='g', name='Nu3')
@@ -130,7 +158,9 @@ try:
         solver.step(timestep)
         if (solver.iteration-1) % 10 == 0:
             max_Re = flow.max('Re')
-            logger.info('Iteration=%i, Time=%e, dt=%e, max(Re)=%f' %(solver.iteration, solver.sim_time, timestep, max_Re))
+            logger.info(f'Iteration={solver.iteration:.0f}, Time={solver.sim_time:.8g}, dt={timestep:.6e}, max(Re)={max_Re:.7g} \t\t Up to t={stop_sim_time:.0f}: {100*solver.sim_time/stop_sim_time:.3f}%')
+    
+    os.rename(os.getcwd()+'/snapshots' , os.getcwd()+f'/snapshots_{Rayleigh:.0e}')
 except:
     logger.error('Exception raised, triggering end of main loop.')
     raise
